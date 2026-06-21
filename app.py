@@ -8,15 +8,89 @@ import requests
 import os
 
 # ─── Configuration ────────────────────────────────────────────────────────────
-# Sur Databricks Apps, ces variables sont injectées automatiquement
-# dans l'environnement — pas besoin de les hardcoder
 SERVING_ENDPOINT_NAME = "rag-chatbot-endpoint"
+DATABRICKS_HOST       = os.environ.get("DATABRICKS_HOST", "")
 
-# Databricks Apps injecte automatiquement DATABRICKS_HOST et DATABRICKS_TOKEN
-DATABRICKS_HOST  = os.environ.get("DATABRICKS_HOST", "")
-DATABRICKS_TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
+# Databricks Apps injecte CLIENT_ID + CLIENT_SECRET via le Service Principal
+CLIENT_ID     = os.environ.get("DATABRICKS_CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("DATABRICKS_CLIENT_SECRET", "")
 
 ENDPOINT_URL = f"{DATABRICKS_HOST}/serving-endpoints/{SERVING_ENDPOINT_NAME}/invocations"
+
+
+# ─── Auth OAuth M2M ───────────────────────────────────────────────────────────
+def get_token() -> str:
+    """
+    Obtient un token OAuth M2M via le Service Principal de l'App.
+    Databricks Apps injecte DATABRICKS_CLIENT_ID et DATABRICKS_CLIENT_SECRET
+    automatiquement — pas besoin de les hardcoder.
+    """
+    response = requests.post(
+        f"{DATABRICKS_HOST}/oidc/v1/token",
+        data={
+            "grant_type":    "client_credentials",
+            "scope":         "all-apis",
+            "client_id":     CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+        }
+    )
+    response.raise_for_status()
+    return response.json()["access_token"]
+
+
+# ─── Appel au Model Serving Endpoint ──────────────────────────────────────────
+def call_rag_endpoint(query: str) -> dict:
+    """
+    Appelle le Model Serving Endpoint RAG via HTTP.
+    1. Obtient un token OAuth M2M frais
+    2. POST vers /serving-endpoints/rag-chatbot-endpoint/invocations
+    3. Retourne la réponse du chatbot RAG
+    """
+    try:
+        token = get_token()
+        response = requests.post(
+            ENDPOINT_URL,
+            json={"dataframe_records": [{"query": query}]},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type":  "application/json"
+            },
+            timeout=120  # 2 min — nécessaire si l'endpoint est en cold start
+        )
+        response.raise_for_status()
+        answer = response.json()["predictions"][0]
+        return {"success": True, "answer": answer}
+
+    except requests.exceptions.Timeout:
+        return {
+            "success": False,
+            "answer": "⏳ L'endpoint met du temps à répondre (cold start). Réessaie dans 30 secondes."
+        }
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
+            return {
+                "success": False,
+                "answer": "❌ Endpoint introuvable. Vérifie que `rag-chatbot-endpoint` est bien déployé."
+            }
+        return {"success": False, "answer": f"❌ Erreur HTTP {e.response.status_code} : {str(e)}"}
+    except Exception as e:
+        return {"success": False, "answer": f"❌ Erreur : {str(e)}"}
+
+
+# ─── Extraction des sources depuis la réponse ─────────────────────────────────
+def extract_sources(answer: str) -> list:
+    """
+    Extrait les références de sources depuis la réponse du LLM.
+    Le LLM est instruit de citer les sources au format [Source X].
+    """
+    import re
+    sources = []
+    matches  = re.findall(r'\[Source \d+[^\]]*\]', answer)
+    sources.extend(matches)
+    matches2 = re.findall(r'\([^)]*\.pdf[^)]*\)', answer)
+    sources.extend(matches2)
+    return list(set(sources)) if sources else []
+
 
 # ─── Configuration de la page ─────────────────────────────────────────────────
 st.set_page_config(
@@ -61,75 +135,12 @@ st.markdown("""
 
 st.divider()
 
-# ─── Initialisation de l'historique de conversation ───────────────────────────
-# st.session_state persiste pendant toute la session utilisateur
+# ─── Initialisation de l'historique ───────────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
 if "sources_history" not in st.session_state:
     st.session_state.sources_history = {}
-
-
-# ─── Fonction d'appel au Model Serving Endpoint ───────────────────────────────
-def call_rag_endpoint(query: str) -> dict:
-    """
-    Appelle le Model Serving Endpoint RAG via HTTP.
-
-    L'endpoint reçoit une question et retourne :
-    - La réponse générée par le LLM (Llama 3.3 70B)
-    - Basée sur les chunks retrievés depuis le Vector Search
-
-    Format attendu par MLflow Serving :
-    {"dataframe_records": [{"query": "..."}]}
-    """
-    try:
-        response = requests.post(
-            ENDPOINT_URL,
-            json={"dataframe_records": [{"query": query}]},
-            headers={
-                "Authorization": f"Bearer {DATABRICKS_TOKEN}",
-                "Content-Type":  "application/json"
-            },
-            timeout=120  # 2 min — nécessaire si l'endpoint est en cold start
-        )
-        response.raise_for_status()
-        answer = response.json()["predictions"][0]
-        return {"success": True, "answer": answer}
-
-    except requests.exceptions.Timeout:
-        return {
-            "success": False,
-            "answer": "⏳ L'endpoint met du temps à répondre (cold start). Réessaie dans 30 secondes."
-        }
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 404:
-            return {
-                "success": False,
-                "answer": "❌ Endpoint introuvable. Vérifie que `rag-chatbot-endpoint` est bien déployé."
-            }
-        return {"success": False, "answer": f"❌ Erreur HTTP {e.response.status_code} : {str(e)}"}
-    except Exception as e:
-        return {"success": False, "answer": f"❌ Erreur inattendue : {str(e)}"}
-
-
-def extract_sources(answer: str) -> list[str]:
-    """
-    Extrait les références de sources depuis la réponse du LLM.
-    Le LLM est instruit de citer les sources au format [Source X] ou (fichier, page X).
-    """
-    import re
-    sources = []
-
-    # Pattern [Source 1], [Source 2], etc.
-    matches = re.findall(r'\[Source \d+[^\]]*\]', answer)
-    sources.extend(matches)
-
-    # Pattern (fichier.pdf, page X)
-    matches2 = re.findall(r'\([^)]*\.pdf[^)]*\)', answer)
-    sources.extend(matches2)
-
-    return list(set(sources)) if sources else []
-
 
 # ─── Affichage de l'historique des messages ───────────────────────────────────
 for i, message in enumerate(st.session_state.messages):
@@ -147,11 +158,10 @@ for i, message in enumerate(st.session_state.messages):
                         unsafe_allow_html=True
                     )
 
-
 # ─── Zone de saisie ───────────────────────────────────────────────────────────
 if query := st.chat_input("Posez votre question sur les documents..."):
 
-    # Ajout du message utilisateur à l'historique
+    # Ajout du message utilisateur
     st.session_state.messages.append({"role": "user", "content": query})
     with st.chat_message("user"):
         st.markdown(query)
@@ -166,7 +176,6 @@ if query := st.chat_input("Posez votre question sur les documents..."):
 
         st.markdown(answer)
 
-        # Affichage des sources extraites
         if sources:
             st.markdown("**📚 Sources citées :**")
             for src in sources:
@@ -175,7 +184,6 @@ if query := st.chat_input("Posez votre question sur les documents..."):
                     unsafe_allow_html=True
                 )
         elif result["success"]:
-            # Réponse valide mais pas de sources détectées
             st.markdown(
                 '<div class="warning-box">ℹ️ Aucune source détectée dans la réponse</div>',
                 unsafe_allow_html=True
@@ -187,7 +195,7 @@ if query := st.chat_input("Posez votre question sur les documents..."):
     st.session_state.sources_history[msg_index] = sources
 
 
-# ─── Sidebar — Infos & contrôles ──────────────────────────────────────────────
+# ─── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## ⚙️ Informations")
 
@@ -211,12 +219,14 @@ with st.sidebar:
     st.markdown("### 🔌 Statut de l'endpoint")
     if st.button("Vérifier le statut"):
         try:
-            from databricks.sdk import WorkspaceClient
-            w      = WorkspaceClient()
-            ep     = w.serving_endpoints.get(SERVING_ENDPOINT_NAME)
-            state  = ep.state.ready.value
+            token    = get_token()
+            response = requests.get(
+                f"{DATABRICKS_HOST}/api/2.0/serving-endpoints/{SERVING_ENDPOINT_NAME}",
+                headers={"Authorization": f"Bearer {token}"}
+            )
+            state = response.json().get("state", {}).get("ready", "UNKNOWN")
             if state == "READY":
-                st.success(f"✅ READY")
+                st.success("✅ READY")
             else:
                 st.warning(f"⚠️ {state}")
         except Exception as e:
@@ -224,9 +234,9 @@ with st.sidebar:
 
     st.divider()
 
-    # Bouton pour vider l'historique
+    # Vider la conversation
     if st.button("🗑️ Vider la conversation"):
-        st.session_state.messages       = []
+        st.session_state.messages        = []
         st.session_state.sources_history = {}
         st.rerun()
 
@@ -242,6 +252,5 @@ with st.sidebar:
     ]
     for q in example_questions:
         if st.button(q, key=f"ex_{q}"):
-            # Simule une saisie utilisateur
             st.session_state.messages.append({"role": "user", "content": q})
             st.rerun()
