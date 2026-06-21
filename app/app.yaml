@@ -1,4 +1,7 @@
-command: ["python", "-m", "streamlit", "run", "app.py", "--server.port", "8080"]
+command: [
+  "bash", "-c",
+  "pip install streamlit requests databricks-sdk && python -m streamlit run app.py --server.port 8080"
+]
 
 env:
   - name: STREAMLIT_SERVER_ENABLE_CORS
